@@ -87,3 +87,11 @@ configurations.all {
         }
     }
 }
+
+configurations.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "io.ktor") {
+            useVersion("2.3.12")
+        }
+    }
+}

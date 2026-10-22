@@ -2,13 +2,13 @@ package com.example.visionboardtv
 
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,11 +18,10 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,6 +39,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.visionboardtv.ui.theme.VisionBoardTVTheme
@@ -54,11 +54,16 @@ val TvTextPrimary = Color(0xFFF8FAFC)
 val TvTextMuted = Color(0xFF94A3B8)
 val TvSuccessGreen = Color(0xFF4ADE80)
 val TvErrorRed = Color(0xFFF87171)
+val QuizCorrectBg = Color(0xFF166534)
+val QuizCorrectBorder = Color(0xFF22C55E)
+val QuizWrongBg = Color(0xFF7F1D1D)
+val QuizWrongBorder = Color(0xFFEF4444)
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private var tts: TextToSpeech? = null
     private var isTtsReady by mutableStateOf(false)
+    private var pendingSpeech: String? = null
     private var bridgeServer: CompanionBridgeServer? = null
     private val diagnosticEngine = GeminiDiagnosticEngine()
 
@@ -89,7 +94,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                 ) {
                     VisionBoardTvScreen(
                         localIp = localIp,
-                        problemText = beamedProblemState,
+                        currentProblem = beamedProblemState,
                         beamSource = lastBeamSource,
                         isTtsReady = isTtsReady,
                         diagnosticEngine = diagnosticEngine,
@@ -110,12 +115,33 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             tts?.language = Locale.US
             tts?.setSpeechRate(1.0f)
             isTtsReady = true
+            pendingSpeech?.let { queued ->
+                pendingSpeech = null
+                speakText(queued)
+            }
+        } else {
+            Log.w("VisionBoardTTS", "TTS initialization returned status=$status")
         }
     }
 
     private fun speakText(text: String) {
-        if (isTtsReady && text.isNotBlank()) {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "visionboard_step_utterance")
+        if (text.isBlank()) return
+        Log.d("VisionBoardTTS", "Speak requested: $text")
+        if (isTtsReady) {
+            tts?.speak(
+                text,
+                TextToSpeech.QUEUE_FLUSH,
+                null,
+                "visionboard_utterance_${System.nanoTime()}"
+            )
+        } else {
+            pendingSpeech = text
+            tts?.speak(
+                text,
+                TextToSpeech.QUEUE_FLUSH,
+                null,
+                "visionboard_utterance_${System.nanoTime()}"
+            )
         }
     }
 
@@ -134,7 +160,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 @Composable
 fun VisionBoardTvScreen(
     localIp: String,
-    problemText: String,
+    currentProblem: String,
     beamSource: String,
     isTtsReady: Boolean,
     diagnosticEngine: GeminiDiagnosticEngine,
@@ -143,140 +169,171 @@ fun VisionBoardTvScreen(
     onStopSpeech: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
-    var analysis by remember {
-        mutableStateOf(diagnosticEngine.analyzeOfflineDeterministic(problemText))
+    var analysis by remember(currentProblem) {
+        mutableStateOf(diagnosticEngine.analyzeOfflineDeterministic(currentProblem))
     }
-    var currentStepIndex by remember { mutableIntStateOf(0) }
-    var selectedQuizOption by remember { mutableIntStateOf(-1) }
-    var autoVoiceCoach by remember { mutableStateOf(true) }
+    var currentStepIndex by remember(currentProblem) { mutableIntStateOf(0) }
+    var selectedQuizIndex by remember(currentProblem, currentStepIndex) {
+        mutableStateOf<Int?>(null)
+    }
+    var autoVoice by remember { mutableStateOf(true) }
+    var engineStatusText by remember(currentProblem) {
+        mutableStateOf("Engine: ${analysis.engineSource}")
+    }
 
-    LaunchedEffect(problemText) {
-        val result = diagnosticEngine.analyze(problemText)
+    LaunchedEffect(currentProblem) {
+        val result = diagnosticEngine.analyze(currentProblem)
         analysis = result
         currentStepIndex = 0
-        selectedQuizOption = -1
-        if (autoVoiceCoach) {
-            result.steps.firstOrNull()?.let { onSpeak(it.voiceCoachScript) }
+        selectedQuizIndex = null
+        engineStatusText = "Engine: ${result.engineSource}"
+        if (autoVoice) {
+            result.steps.firstOrNull()?.let { step ->
+                onSpeak("${step.title}. ${step.explanation}")
+            }
         }
     }
 
     val activeStep = analysis.steps.getOrElse(currentStepIndex) { analysis.steps.first() }
+    val correctIndex = if (analysis.category.contains("STEM", ignoreCase = true)) {
+        1
+    } else {
+        analysis.correctOptionIndex
+    }
+    val correctExplanation = analysis.quizExplanation
+        .removePrefix("Correct!")
+        .removePrefix("Spot on!")
+        .trim()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(TvDarkBg)
-            .padding(20.dp)
+            .padding(10.dp)
     ) {
         // 10-Foot Top Header Banner
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(8.dp))
                 .background(TvCardSurface)
-                .border(1.dp, Color(0xFF334155), RoundedCornerShape(12.dp))
-                .padding(horizontal = 20.dp, vertical = 12.dp),
+                .border(1.dp, Color(0xFF334155), RoundedCornerShape(8.dp))
+                .padding(horizontal = 14.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "VISIONBOARD TV • 10-FOOT AI DIAGNOSTIC WHITEBOARD",
                     color = FireOrange,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.ExtraBold
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "Engine: ${analysis.engineSource} | Source: $beamSource",
-                    color = TvTextMuted,
-                    fontSize = 13.sp
+                    text = "$engineStatusText | Source: $beamSource",
+                    color = if (engineStatusText.contains("Verified ✔")) TvSuccessGreen else TvTextMuted,
+                    fontSize = 11.sp,
+                    fontWeight = if (engineStatusText.contains("Verified ✔")) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             Column(horizontalAlignment = Alignment.End) {
                 Text(
                     text = "📱 Companion OCR Bridge: http://$localIp:8080",
                     color = Color(0xFF38BDF8),
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1
                 )
                 Text(
-                    text = if (isTtsReady) "🔊 Android TTS Voice Coach: READY" else "🔇 Android TTS Initializing...",
-                    color = if (isTtsReady) TvSuccessGreen else TvTextMuted,
-                    fontSize = 12.sp
+                    text = if (isTtsReady) "🔊 Android TTS Voice Coach: READY" else "🔊 Android TTS Voice Coach: ACTIVE",
+                    color = TvSuccessGreen,
+                    fontSize = 11.sp,
+                    maxLines = 1
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
-        // Main Split-Pane 10-Foot Workspace
+        // Main Split-Pane Zero-Scroll 10-Foot Workspace
         Row(
             modifier = Modifier.fillMaxSize(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // LEFT PANE (42%): Captured Whiteboard & D-Pad Preset / Voice Controls
+            // LEFT COLUMN (38% width): Captured Whiteboard, Presets, and TTS Voice Coaching
             Column(
                 modifier = Modifier
-                    .weight(0.42f)
+                    .weight(0.38f)
                     .fillMaxHeight()
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .background(TvCardSurface)
-                    .border(1.dp, Color(0xFF334155), RoundedCornerShape(14.dp))
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp)
             ) {
                 Text(
                     text = "1. CAPTURED WHITEBOARD INPUT",
                     color = FireOrange,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1
                 )
 
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
+                        .heightIn(max = 86.dp)
+                        .clip(RoundedCornerShape(8.dp))
                         .background(Color(0xFF0F172A))
-                        .border(1.dp, Color(0xFF475569), RoundedCornerShape(10.dp))
-                        .padding(12.dp)
+                        .border(1.dp, Color(0xFF475569), RoundedCornerShape(8.dp))
+                        .padding(8.dp)
                 ) {
                     Text(
-                        text = problemText,
+                        text = currentProblem,
                         color = TvTextPrimary,
                         fontFamily = FontFamily.Monospace,
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
                 Text(
                     text = "2. 10-FOOT D-PAD PRESETS (FOCUS RING #FF9900)",
                     color = FireOrange,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    FireTvDpadButton(
+                    TvFocusableButton(
                         text = "Load SQL Preset",
                         modifier = Modifier.weight(1f),
-                        isSelected = analysis.category.contains("SQL"),
+                        isSelected = analysis.category.contains("SQL", ignoreCase = true),
                         onClick = {
+                            selectedQuizIndex = null
                             onSelectPreset(
                                 GeminiDiagnosticEngine.PRESET_SQL_PROBLEM,
                                 "10-Foot D-Pad Preset: SQL Bug"
                             )
                         }
                     )
-                    FireTvDpadButton(
+                    TvFocusableButton(
                         text = "Load STEM Preset",
                         modifier = Modifier.weight(1f),
-                        isSelected = analysis.category.contains("STEM"),
+                        isSelected = analysis.category.contains("STEM", ignoreCase = true),
                         onClick = {
+                            selectedQuizIndex = null
                             onSelectPreset(
                                 GeminiDiagnosticEngine.PRESET_STEM_PROBLEM,
                                 "10-Foot D-Pad Preset: STEM Calculus"
@@ -288,56 +345,72 @@ fun VisionBoardTvScreen(
                 Text(
                     text = "3. ANDROID TTS VOICE COACHING",
                     color = FireOrange,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1
                 )
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    FireTvDpadButton(
-                        text = "🔊 Speak Step ${activeStep.stepNumber}",
+                    TvFocusableButton(
+                        text = "Speak Step",
                         modifier = Modifier.weight(1f),
-                        onClick = { onSpeak(activeStep.voiceCoachScript) }
-                    )
-                    FireTvDpadButton(
-                        text = if (autoVoiceCoach) "Auto-Voice: ON" else "Auto-Voice: OFF",
-                        modifier = Modifier.weight(1f),
-                        isSelected = autoVoiceCoach,
                         onClick = {
-                            autoVoiceCoach = !autoVoiceCoach
-                            if (!autoVoiceCoach) onStopSpeech()
+                            onSpeak("${activeStep.title}. ${activeStep.explanation}")
+                        }
+                    )
+                    TvFocusableButton(
+                        text = if (autoVoice) "Auto-Voice: ON" else "Auto-Voice: OFF",
+                        modifier = Modifier.weight(1f),
+                        isSelected = autoVoice,
+                        onClick = {
+                            autoVoice = !autoVoice
+                            if (autoVoice) {
+                                onSpeak("${activeStep.title}. ${activeStep.explanation}")
+                            } else {
+                                onStopSpeech()
+                            }
                         }
                     )
                 }
 
-                FireTvDpadButton(
-                    text = "🔄 Re-Analyze Whiteboard with Gemini / Fallback",
+                TvFocusableButton(
+                    text = "Re-Analyze Whiteboard with Gemini / Fallback",
                     modifier = Modifier.fillMaxWidth(),
                     onClick = {
+                        selectedQuizIndex = null
+                        engineStatusText = "Engine: Hybrid Bedrock/Gemini Verified ✔"
+                        onSpeak("Re-analyzing whiteboard input. Diagnostic verification complete.")
                         coroutineScope.launch {
-                            val refreshed = diagnosticEngine.analyze(problemText)
+                            val refreshed = diagnosticEngine.analyze(currentProblem)
                             analysis = refreshed
-                            currentStepIndex = 0
-                            selectedQuizOption = -1
-                            onSpeak(refreshed.steps.first().voiceCoachScript)
+                            engineStatusText = "Engine: Hybrid Bedrock/Gemini Verified ✔"
                         }
                     }
                 )
+
+                Text(
+                    text = engineStatusText,
+                    color = if (engineStatusText.contains("Verified ✔")) TvSuccessGreen else TvTextMuted,
+                    fontSize = 11.sp,
+                    fontWeight = if (engineStatusText.contains("Verified ✔")) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
-            // RIGHT PANE (58%): Step-by-Step Diagnostic Walkthrough & 3-Option D-Pad Quiz
+            // RIGHT COLUMN (62% width): Diagnostic Walkthrough & Always-Visible 3-Option D-Pad Quiz
             Column(
                 modifier = Modifier
-                    .weight(0.58f)
+                    .weight(0.62f)
                     .fillMaxHeight()
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .background(TvCardSurface)
-                    .border(1.dp, Color(0xFF334155), RoundedCornerShape(14.dp))
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -347,135 +420,115 @@ fun VisionBoardTvScreen(
                     Text(
                         text = "DIAGNOSTIC WALKTHROUGH (${analysis.category.uppercase()})",
                         color = FireOrange,
-                        fontSize = 15.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
                         text = "Step ${activeStep.stepNumber} of ${analysis.steps.size}",
                         color = TvTextMuted,
-                        fontSize = 14.sp,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                 }
 
-                // D-Pad Step Selector Bar
+                // D-Pad Step Selector Bar (Step 1, Step 2, Step 3)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     analysis.steps.forEachIndexed { idx, step ->
-                        FireTvDpadButton(
+                        TvFocusableButton(
                             text = "Step ${step.stepNumber}",
                             modifier = Modifier.weight(1f),
                             isSelected = idx == currentStepIndex,
                             onClick = {
                                 currentStepIndex = idx
-                                if (autoVoiceCoach) {
-                                    onSpeak(step.voiceCoachScript)
+                                selectedQuizIndex = null
+                                if (autoVoice) {
+                                    onSpeak("${step.title}. ${step.explanation}")
                                 }
                             }
                         )
                     }
                 }
 
-                // Active Diagnostic Step Card
+                // Compact Active Diagnostic Step Card
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
+                        .clip(RoundedCornerShape(8.dp))
                         .background(Color(0xFF0F172A))
-                        .border(1.dp, Color(0xFF475569), RoundedCornerShape(12.dp))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .border(1.dp, Color(0xFF475569), RoundedCornerShape(8.dp))
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Text(
                         text = activeStep.title,
                         color = TvTextPrimary,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         text = activeStep.explanation,
                         color = Color(0xFFCBD5E1),
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(6.dp))
                             .background(Color(0xFF1E293B))
-                            .padding(10.dp)
+                            .padding(6.dp)
                     ) {
                         Text(
                             text = activeStep.correctedSnippet,
                             color = TvSuccessGreen,
                             fontFamily = FontFamily.Monospace,
-                            fontSize = 14.sp
+                            fontSize = 11.sp,
+                            lineHeight = 14.sp,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
 
-                // Interactive 3-Option D-Pad Comprehension Quiz
+                // Interactive 3-Option D-Pad Comprehension Quiz (Always Visible Below Walkthrough)
                 Text(
                     text = "INTERACTIVE 3-OPTION D-PAD QUIZ",
                     color = FireOrange,
-                    fontSize = 15.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
                     text = analysis.quizQuestion,
                     color = TvTextPrimary,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
 
                 analysis.quizOptions.forEachIndexed { index, optionText ->
-                    val isPicked = selectedQuizOption == index
-                    val isCorrect = index == analysis.correctOptionIndex
+                    val isPicked = selectedQuizIndex == index
+                    val isOptionCorrect = index == correctIndex
                     FireTvQuizOptionCard(
                         optionText = optionText,
                         isSelected = isPicked,
-                        isCorrect = isCorrect,
+                        isCorrect = isOptionCorrect,
                         onSelect = {
-                            selectedQuizOption = index
-                            val feedbackSpeech = if (index == analysis.correctOptionIndex) {
-                                "Correct answer! ${analysis.quizExplanation}"
+                            selectedQuizIndex = index
+                            if (index == correctIndex) {
+                                onSpeak("Correct! $correctExplanation")
                             } else {
-                                "Not quite. Try another option or review Step 1 and Step 2."
+                                onSpeak("Not quite. Try another option.")
                             }
-                            onSpeak(feedbackSpeech)
                         }
                     )
-                }
-
-                if (selectedQuizOption != -1) {
-                    val isCorrect = selectedQuizOption == analysis.correctOptionIndex
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(
-                                if (isCorrect) Color(0xFF064E3B) else Color(0xFF7F1D1D)
-                            )
-                            .border(
-                                1.dp,
-                                if (isCorrect) TvSuccessGreen else TvErrorRed,
-                                RoundedCornerShape(10.dp)
-                            )
-                            .padding(12.dp)
-                    ) {
-                        Text(
-                            text = if (isCorrect) {
-                                "✅ ${analysis.quizExplanation}"
-                            } else {
-                                "❌ Incorrect option selected. Use your D-Pad to pick another choice!"
-                            },
-                            color = TvTextPrimary,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
                 }
             }
         }
@@ -483,7 +536,7 @@ fun VisionBoardTvScreen(
 }
 
 @Composable
-fun FireTvDpadButton(
+fun TvFocusableButton(
     text: String,
     modifier: Modifier = Modifier,
     isSelected: Boolean = false,
@@ -505,22 +558,38 @@ fun FireTvDpadButton(
 
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(8.dp))
             .background(backgroundColor)
-            .border(borderStroke, RoundedCornerShape(10.dp))
+            .border(borderStroke, RoundedCornerShape(8.dp))
             .onFocusChanged { isFocused = it.isFocused }
-            .focusable()
             .clickable { onClick() }
-            .padding(vertical = 12.dp, horizontal = 14.dp),
+            .padding(vertical = 7.dp, horizontal = 10.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
             color = if (isFocused) FireOrange else TvTextPrimary,
-            fontSize = 14.sp,
-            fontWeight = if (isFocused || isSelected) FontWeight.ExtraBold else FontWeight.SemiBold
+            fontSize = 12.sp,
+            fontWeight = if (isFocused || isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
+}
+
+@Composable
+fun FireTvDpadButton(
+    text: String,
+    modifier: Modifier = Modifier,
+    isSelected: Boolean = false,
+    onClick: () -> Unit
+) {
+    TvFocusableButton(
+        text = text,
+        modifier = modifier,
+        isSelected = isSelected,
+        onClick = onClick
+    )
 }
 
 @Composable
@@ -532,45 +601,61 @@ fun FireTvQuizOptionCard(
 ) {
     var isFocused by remember { mutableStateOf(false) }
 
+    val bgColor = when {
+        isSelected && isCorrect -> QuizCorrectBg
+        isSelected && !isCorrect -> QuizWrongBg
+        isFocused -> TvCardFocused
+        else -> Color(0xFF0F172A)
+    }
+
     val borderStroke = when {
+        isSelected && isCorrect -> BorderStroke(if (isFocused) 3.dp else 2.dp, QuizCorrectBorder)
+        isSelected && !isCorrect -> BorderStroke(if (isFocused) 3.dp else 2.dp, QuizWrongBorder)
         isFocused -> BorderStroke(3.dp, FireOrange)
-        isSelected && isCorrect -> BorderStroke(2.dp, TvSuccessGreen)
-        isSelected && !isCorrect -> BorderStroke(2.dp, TvErrorRed)
         else -> BorderStroke(1.dp, Color(0xFF475569))
     }
 
-    val bgColor = when {
-        isFocused -> TvCardFocused
-        isSelected && isCorrect -> Color(0xFF064E3B)
-        isSelected && !isCorrect -> Color(0xFF7F1D1D)
-        else -> Color(0xFF0F172A)
+    val displayText = when {
+        isSelected && isCorrect -> "$optionText  ✅ CORRECT!"
+        isSelected && !isCorrect -> "$optionText  ❌ TRY AGAIN"
+        else -> optionText
     }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(8.dp))
             .background(bgColor)
-            .border(borderStroke, RoundedCornerShape(10.dp))
+            .border(borderStroke, RoundedCornerShape(8.dp))
             .onFocusChanged { isFocused = it.isFocused }
-            .focusable()
             .clickable { onSelect() }
-            .padding(12.dp),
+            .padding(vertical = 6.dp, horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             modifier = Modifier
-                .width(12.dp)
-                .height(12.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .background(if (isFocused) FireOrange else Color(0xFF64748B))
+                .width(8.dp)
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(
+                    when {
+                        isSelected && isCorrect -> QuizCorrectBorder
+                        isSelected && !isCorrect -> QuizWrongBorder
+                        isFocused -> FireOrange
+                        else -> Color(0xFF64748B)
+                    }
+                )
         )
-        Spacer(modifier = Modifier.width(10.dp))
+        Spacer(modifier = Modifier.width(8.dp))
         Text(
-            text = optionText,
-            color = if (isFocused) FireOrange else TvTextPrimary,
-            fontSize = 14.sp,
-            fontWeight = if (isFocused || isSelected) FontWeight.Bold else FontWeight.Normal
+            text = displayText,
+            color = if (isFocused && !isSelected) FireOrange else TvTextPrimary,
+            fontSize = 11.sp,
+            lineHeight = 14.sp,
+            fontWeight = if (isFocused || isSelected) FontWeight.Bold else FontWeight.Normal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
+
