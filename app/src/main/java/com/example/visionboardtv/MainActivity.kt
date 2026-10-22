@@ -126,18 +126,22 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
     private fun speakText(text: String) {
         if (text.isBlank()) return
-        Log.d("VisionBoardTTS", "Speak requested: $text")
+        val sanitizedText = text
+            .replace("`", "")
+            .replace("*", " times ")
+            .replace("^2", " squared")
+        Log.d("VisionBoardTTS", "Speak requested: $sanitizedText")
         if (isTtsReady) {
             tts?.speak(
-                text,
+                sanitizedText,
                 TextToSpeech.QUEUE_FLUSH,
                 null,
                 "visionboard_utterance_${System.nanoTime()}"
             )
         } else {
-            pendingSpeech = text
+            pendingSpeech = sanitizedText
             tts?.speak(
-                text,
+                sanitizedText,
                 TextToSpeech.QUEUE_FLUSH,
                 null,
                 "visionboard_utterance_${System.nanoTime()}"
