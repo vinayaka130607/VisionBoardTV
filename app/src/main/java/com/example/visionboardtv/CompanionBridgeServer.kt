@@ -24,7 +24,11 @@ class CompanionBridgeServer(
     private val onTextBeamed: (String) -> Unit
 ) {
     private var server: CIOApplicationEngine? = null
-    private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serverScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, t ->
+            android.util.Log.e("CompanionBridge", "Server error", t)
+        }
+    )
 
     fun start() {
         if (server != null) return
@@ -77,8 +81,8 @@ class CompanionBridgeServer(
                 }
                 server = engine
                 engine.start(wait = false)
-            } catch (_: Exception) {
-                // Socket already bound or unavailable in restricted test environment
+            } catch (t: Throwable) {
+                android.util.Log.e("CompanionBridge", "Server error", t)
             }
         }
     }
@@ -86,7 +90,8 @@ class CompanionBridgeServer(
     fun stop() {
         try {
             server?.stop(gracePeriodMillis = 300, timeoutMillis = 600)
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
+            android.util.Log.e("CompanionBridge", "Server stop error", t)
         } finally {
             server = null
         }
@@ -259,7 +264,7 @@ WHERE o.status = 'COMPLETED' AND u.deleted_at = NULL;</textarea>
                     }
                 }
                 "127.0.0.1"
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 "127.0.0.1"
             }
         }
